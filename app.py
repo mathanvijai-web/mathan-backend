@@ -132,3 +132,31 @@ def optionchain():
 if __name__=="__main__":
     port=int(os.environ.get("PORT",5000))
     app.run(host="0.0.0.0",port=port)
+
+@app.route("/api/spot",methods=["POST","OPTIONS"])
+def spot():
+    if request.method=="OPTIONS":
+        return jsonify({"status":True}),200
+    token=(request.json or{}).get("token","")
+    try:
+        # Dhan LTP for NIFTY and SENSEX indices
+        payload={
+            "NSE_INDEX":["NIFTY 50","NIFTY BANK"],
+            "BSE_INDEX":["SENSEX"]
+        }
+        r=requests.post(f"{DHAN_BASE}/marketfeed/ltp",
+            headers=hdrs(token),json=payload,timeout=10)
+        if r.status_code==200:
+            data=r.json()
+            result={}
+            # Parse NIFTY
+            nse=data.get("data",{}).get("NSE_INDEX",{})
+            bse=data.get("data",{}).get("BSE_INDEX",{})
+            if "NIFTY 50" in nse:
+                result["nifty"]=nse["NIFTY 50"].get("last_price",0)
+            if "SENSEX" in bse:
+                result["sensex"]=bse["SENSEX"].get("last_price",0)
+            return jsonify({"status":True,"data":result})
+        return jsonify({"status":False,"message":f"Dhan {r.status_code}"}),400
+    except Exception as e:
+        return jsonify({"status":False,"message":str(e)}),500
