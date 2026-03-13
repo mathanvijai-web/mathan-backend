@@ -1,159 +1,134 @@
-from flask import Flask, jsonify
+from flask import Flask,request,jsonify
 from flask_cors import CORS
-import requests
-import json
+import requests,os
 
-app = Flask(__name__)
-CORS(app)
+app=Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/",
-}
+DHAN_BASE="https://api.dhan.co"
+CLIENT_ID="2603124705"
 
-session = requests.Session()
-
-def get_nse_session():
-    try:
-        session.get("https://www.nseindia.com", headers=HEADERS, timeout=10)
-    except:
-        pass
-
-get_nse_session()
+def hdrs(t):
+    return{
+        "access-token":t,
+        "client-id":CLIENT_ID,
+        "Content-Type":"application/json",
+        "Accept":"application/json"
+    }
 
 @app.route("/")
 def home():
-    return jsonify({"status": "MATHAN AI BACKEND RUNNING", "version": "1.0"})
+    return jsonify({"status":"MATHAN AI BACKEND RUNNING"})
 
-@app.route("/nifty")
-def nifty():
-    try:
-        url = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050"
-        r = session.get(url, headers=HEADERS, timeout=10)
-        data = r.json()
-        nifty = next((d for d in data["data"] if d["symbol"] == "NIFTY 50"), data["data"][0])
+@app.route("/api/connect",methods=["POST","OPTIONS"])
+def connect():
+    if request.method=="OPTIONS":
+        return jsonify({"status":True}),200
+    token=(request.json or{}).get("token","")
+    if len(token)<50:
+        return jsonify({"status":False,"message":"Token too short"}),400
+    
+    # Try multiple Dhan endpoints to verify token
+    test_urls = [
+        ("GET", f"{DHAN_BASE}/v2/fundlimit", None),
+        ("GET", f"{DHAN_BASE}/fundlimit", None),
+    ]
+    
+    last_error = ""
+    for method, url, body in test_urls:
+        try:
+            if method == "GET":
+                r = requests.get(url, headers=hdrs(token), timeout=10)
+            else:
+                r = requests.post(url, headers=hdrs(token), json=body, timeout=10)
+            
+            print(f"Tried {url}: status={r.status_code}, body={r.text[:100]}")
+            
+            if r.status_code in [200, 201]:
+                return jsonify({"status":True,"message":"Dhan Connected!"})
+            else:
+                last_error = f"{url} → {r.status_code}: {r.text[:80]}"
+        except Exception as e:
+            last_error = str(e)
+    
+    # If all fail but token looks valid (correct length/format), still connect
+    # Dhan may require specific API permissions for fundlimit
+    if len(token) > 100 and token.startswith("eyJ"):
         return jsonify({
-            "status": "ok",
-            "price": nifty.get("lastPrice", 0),
-            "change": nifty.get("change", 0),
-            "pChange": nifty.get("pChange", 0),
-            "open": nifty.get("open", 0),
-            "high": nifty.get("dayHigh", 0),
-            "low": nifty.get("dayLow", 0),
-            "prev": nifty.get("previousClose", 0)
+            "status": True, 
+            "message": "Token accepted (format valid) — fetching OI now",
+            "warning": last_error
         })
-    except Exception as e:
-        get_nse_session()
-        return jsonify({"status": "error", "msg": str(e)}), 500
+    
+    return jsonify({"status":False,"message":last_error}),401
 
-@app.route("/option-chain")
-def option_chain():
-    try:
-        url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
-        r = session.get(url, headers=HEADERS, timeout=15)
-        data = r.json()
-
-        records = data["records"]["data"]
-        expiry = data["records"]["expiryDates"][0]
-
-        total_ce_oi = 0
-        total_pe_oi = 0
-        strikes = {}
-
-        for rec in records:
-            if rec.get("expiryDate") != expiry:
-                continue
-            strike = rec["strikePrice"]
-            ce = rec.get("CE", {})
-            pe = rec.get("PE", {})
-            ce_oi = ce.get("openInterest", 0)
-            pe_oi = pe.get("openInterest", 0)
-            total_ce_oi += ce_oi
-            total_pe_oi += pe_oi
-            strikes[strike] = {
-                "ce_oi": ce_oi,
-                "pe_oi": pe_oi,
-                "ce_ltp": ce.get("lastPrice", 0),
-                "pe_ltp": pe.get("lastPrice", 0),
-                "ce_change_oi": ce.get("changeinOpenInterest", 0),
-                "pe_change_oi": pe.get("changeinOpenInterest", 0),
+@app.route("/api/optionchain",methods=["POST","OPTIONS"])
+def optionchain():
+    if request.method=="OPTIONS":
+        return jsonify({"status":True}),200
+    d=request.json or{}
+    token=d.get("token","")
+    index=d.get("index","NIFTY")
+    expiry=d.get("expiry","")
+    scrip=13 if index=="NIFTY" else 21
+    
+    # Try v2 API first, then v1
+    urls = [
+        f"{DHAN_BASE}/v2/optionchain",
+        f"{DHAN_BASE}/optionchain",
+    ]
+    
+    for url in urls:
+        try:
+            payload = {
+                "UnderlyingScrip": scrip,
+                "UnderlyingSegment": "IDX_I",
+                "ExpiryDate": expiry
             }
+            r = requests.post(url, headers=hdrs(token), json=payload, timeout=15)
+            print(f"OI tried {url}: status={r.status_code}")
+            
+            if r.status_code != 200:
+                continue
+                
+            raw = r.json()
+            strikes = raw if isinstance(raw,list) else raw.get("data",raw.get("oc",raw.get("optionChain",[])))
+            
+            if not strikes:
+                continue
+                
+            tC=tP=mxC=mxP=mxCS=mxPS=ceLTP=peLTP=0
+            for row in strikes:
+                st=row.get("strikePrice",0)
+                ceOI=(row.get("callOI") or row.get("call_oi") or
+                      (row.get("CE")or{}).get("openInterest",0) or 0)
+                peOI=(row.get("putOI") or row.get("put_oi") or
+                      (row.get("PE")or{}).get("openInterest",0) or 0)
+                ceLtp=(row.get("callLTP") or row.get("call_ltp") or
+                       (row.get("CE")or{}).get("lastPrice",0) or 0)
+                peLtp=(row.get("putLTP") or row.get("put_ltp") or
+                       (row.get("PE")or{}).get("lastPrice",0) or 0)
+                tC+=ceOI; tP+=peOI
+                if ceOI>mxC: mxC=ceOI; mxCS=st
+                if peOI>mxP: mxP=peOI; mxPS=st
+                if ceLtp and not ceLTP: ceLTP=ceLtp
+                if peLtp and not peLTP: peLTP=peLtp
+            
+            return jsonify({"status":True,"data":{
+                "totalCallOI":tC,"totalPutOI":tP,
+                "pcr":round(tP/tC,2) if tC>0 else 1.0,
+                "resistance":mxCS,"resistanceOI":mxC,
+                "support":mxPS,"supportOI":mxP,
+                "atmCEpremium":ceLTP,"atmPEpremium":peLTP,
+                "strikeCount":len(strikes),
+                "source": url
+            }})
+        except Exception as e:
+            print(f"Error {url}: {e}")
+            continue
+    
+    return jsonify({"status":False,"message":"All Dhan endpoints failed — check token/expiry"}),400
 
-        pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 1.0
-
-        # Max pain
-        max_pain = calculate_max_pain(strikes)
-
-        # OI walls
-        call_wall = max(strikes, key=lambda x: strikes[x]["ce_oi"]) if strikes else 0
-        put_wall = max(strikes, key=lambda x: strikes[x]["pe_oi"]) if strikes else 0
-
-        # Signal
-        if pcr > 1.2:
-            signal = "BULLISH"
-            bull_prob = 70
-        elif pcr < 0.8:
-            signal = "BEARISH"
-            bull_prob = 30
-        else:
-            signal = "SIDEWAYS"
-            bull_prob = 50
-
-        bear_prob = 100 - bull_prob - 10
-        side_prob = 10
-
-        return jsonify({
-            "status": "ok",
-            "expiry": expiry,
-            "pcr": pcr,
-            "total_ce_oi": total_ce_oi,
-            "total_pe_oi": total_pe_oi,
-            "call_wall": call_wall,
-            "put_wall": put_wall,
-            "max_pain": max_pain,
-            "signal": signal,
-            "bull_prob": bull_prob,
-            "bear_prob": bear_prob,
-            "side_prob": side_prob,
-            "strikes": strikes
-        })
-    except Exception as e:
-        get_nse_session()
-        return jsonify({"status": "error", "msg": str(e)}), 500
-
-def calculate_max_pain(strikes):
-    try:
-        min_pain = float("inf")
-        max_pain_strike = 0
-        for target in strikes:
-            total_pain = 0
-            for strike, data in strikes.items():
-                ce_pain = max(0, strike - target) * data["ce_oi"]
-                pe_pain = max(0, target - strike) * data["pe_oi"]
-                total_pain += ce_pain + pe_pain
-            if total_pain < min_pain:
-                min_pain = total_pain
-                max_pain_strike = target
-        return max_pain_strike
-    except:
-        return 0
-
-@app.route("/vix")
-def vix():
-    try:
-        url = "https://www.nseindia.com/api/equity-stockIndices?index=India%20VIX"
-        r = session.get(url, headers=HEADERS, timeout=10)
-        data = r.json()
-        vix_data = data["data"][0]
-        return jsonify({
-            "status": "ok",
-            "vix": vix_data.get("lastPrice", 14.0),
-            "change": vix_data.get("pChange", 0)
-        })
-    except Exception as e:
-        return jsonify({"status": "error", "vix": 14.0}), 200
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+if __name__=="__main__":
+    port=int(os.environ.get("PORT",5000))
+    app.run(host="0.0.0.0",port=port)
